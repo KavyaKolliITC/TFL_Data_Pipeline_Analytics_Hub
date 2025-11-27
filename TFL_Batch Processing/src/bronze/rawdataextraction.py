@@ -14,8 +14,16 @@ urls = {
     "Victoria": "https://api.tfl.gov.uk/Line/Victoria/Arrivals?app_id=92293faa428041caad3dd647d39753a0&app_key=ba72936a3db54b4ba5792dc8f7acc043"
 }
 
-# Save inside: TFL_Batch Processing/data/raw
-BASE_DIR = os.path.dirname(os.path.dirname(__file__))  # go from src → batch folder
+# Path of this file → .../TFL_Batch Processing/src/bronze/rawdataextraction.py
+CURRENT_FILE = os.path.abspath(__file__)
+
+# Move up to: .../TFL_Batch Processing/src/
+SRC_FOLDER = os.path.dirname(os.path.dirname(CURRENT_FILE))
+
+# Move up again to: .../TFL_Batch Processing/
+BASE_DIR = os.path.dirname(SRC_FOLDER)
+
+# Now build the raw folder path
 RAW_DIR = os.path.join(BASE_DIR, "data", "raw")
 os.makedirs(RAW_DIR, exist_ok=True)
 
@@ -30,10 +38,10 @@ while True:
             data = response.json()
 
             if not data:
-                print(f"No data for {name}")
+                print(f"No data returned for {name}")
                 continue
 
-            # Convert JSON → DataFrame (keeps all columns)
+            # Convert JSON → DataFrame (all columns included)
             df_new = pd.json_normalize(data)
 
             # Add ingestion timestamp
@@ -41,25 +49,25 @@ while True:
 
             file_path = os.path.join(RAW_DIR, f"{name}.csv")
 
-            # If file exists → append, dedupe
+            # Append only NEW data
             if os.path.exists(file_path):
                 df_old = pd.read_csv(file_path)
 
                 df_combined = pd.concat([df_old, df_new], ignore_index=True)
 
-                # Keep unique rows using ID
+                # Remove duplicates based on ID
                 df_combined.drop_duplicates(subset=["id"], inplace=True)
 
                 df_combined.to_csv(file_path, index=False)
+
                 print(f"Updated {file_path} → {len(df_combined)} rows")
 
             else:
-                # First time save
                 df_new.to_csv(file_path, index=False)
                 print(f"Created {file_path} → {len(df_new)} rows")
 
         except Exception as e:
-            print(f" Error fetching {name}: {e}")
+            print(f"Error fetching {name}: {e}")
 
-    print("Waiting 60 seconds...\n")
+    print("\n Waiting 60 seconds before next fetch...\n")
     time.sleep(60)
