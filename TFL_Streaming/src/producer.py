@@ -26,7 +26,7 @@ while True:
     print("Pulling TFL updates...")
 
     for line_name, api in api_list.items():
-        url = f"{api}?app_id={app_id}&app_key={app_key}"
+        url = "{}?app_id={}&app_key={}".format(api, app_id, app_key)
         data = requests.get(url).json()
 
         for event in data:
