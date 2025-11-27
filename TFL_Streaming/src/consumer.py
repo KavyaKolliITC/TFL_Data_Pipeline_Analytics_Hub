@@ -67,7 +67,7 @@ def process_batch(batch_df, batch_id):
 
     # Write in append mode for streaming safety
     df.write.mode("append").parquet(incoming_path)
-    print(f"Wrote batch {batch_id} to incoming parquet")
+    print("Wrote batch {batch_id} to incoming parquet".format(batch_id=batch_id))
 
 
 # Apply foreachBatch for proper streaming writes
