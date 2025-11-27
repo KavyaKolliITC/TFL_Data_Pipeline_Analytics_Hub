@@ -20,9 +20,9 @@ kafka_servers = "ip-172-31-3-80.eu-west-2.compute.internal:9092"
 topic = "ukde011025tfldata"
 
 # hdfs paths
-incoming_path = "/tmp/DE011025/uk/streaming/incoming"
+incoming_path = "hdfs:////tmp/DE011025/uk/streaming/incoming/"
 archive_path = "/tmp/DE011025/uk/streaming/archive"
-checkpoint_path = "/tmp/DE011025/uk/streaming/incoming_checkpoints"
+checkpoint_path = "hdfs:////tmp/DE011025/uk/streaming/incoming_checkpoints"
 
 # tfl arrivals api schema
 tfl_schema = ArrayType(StructType([
