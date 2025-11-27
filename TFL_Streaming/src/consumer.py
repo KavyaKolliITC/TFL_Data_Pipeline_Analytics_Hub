@@ -1,22 +1,30 @@
-from pyspark.sql import SparkSession
+from pyspark.sql import SparkSession 
 from pyspark.sql.functions import *
 from pyspark.sql.types import *
+from pydeequ.checks import Check, CheckLevel
+from pydeequ.verification import VerificationSuite
 
-# ------------------------------------------------------------
-# 1. CREATE SPARK SESSION
-# ------------------------------------------------------------
+# hdfs file system for archiving
+from py4j.java_gateway import java_import
+
+# create spark session
 spark = (
     SparkSession.builder
         .appName("UK_TFL_STREAMING_CONSUMER_DEDUPED")
+        .config("spark.jars.packages", "com.amazon.deequ:deequ:1.2.2-spark-3.3")
         .getOrCreate()
 )
 
+# kafka config
 kafka_servers = "ip-172-31-3-80.eu-west-2.compute.internal:9092"
 topic = "ukde011025tfldata"
 
-# ------------------------------------------------------------
-# 2. OFFICIAL TFL ARRIVALS API SCHEMA
-# ------------------------------------------------------------
+# hdfs paths
+incoming_path = "/tmp/DE011025/uk/streaming/incoming"
+archive_path = "/tmp/DE011025/uk/streaming/archive"
+checkpoint_path = "/tmp/DE011025/uk/streaming/incoming_checkpoints"
+
+# tfl arrivals api schema
 tfl_schema = ArrayType(StructType([
     StructField("id", StringType()),
     StructField("operationType", IntegerType()),
@@ -39,9 +47,20 @@ tfl_schema = ArrayType(StructType([
     StructField("modeName", StringType())
 ]))
 
-# ------------------------------------------------------------
-# 3. READ STREAM FROM KAFKA (REAL-TIME)
-# ------------------------------------------------------------
+# move old parquet files from incoming to archive
+hadoop_fs = spark._jvm.org.apache.hadoop.fs.FileSystem.get(spark._jsc.hadoopConfiguration())
+hadoop_path_incoming = spark._jvm.org.apache.hadoop.fs.Path(incoming_path)
+hadoop_path_archive = spark._jvm.org.apache.hadoop.fs.Path(archive_path)
+
+if hadoop_fs.exists(hadoop_path_incoming):
+    files = hadoop_fs.listStatus(hadoop_path_incoming)
+    for f in files:
+        src = f.getPath()
+        dst = spark._jvm.org.apache.hadoop.fs.Path(archive_path + "/" + src.getName())
+        hadoop_fs.rename(src, dst)
+    print("archived old incoming parquet files")
+
+# read stream from kafka
 kafka_df = (
     spark.readStream
         .format("kafka")
@@ -53,49 +72,62 @@ kafka_df = (
 
 raw_json_df = kafka_df.selectExpr("CAST(value AS STRING) AS json_value")
 
-# ------------------------------------------------------------
-# 4. PARSE JSON USING from_json() SAFELY (STREAMING-SAFE)
-# ------------------------------------------------------------
+# parse json using from_json
 parsed = raw_json_df.withColumn(
     "data", from_json(col("json_value"), tfl_schema)
-).select(explode(col("data")).alias("event"))
+)
 
-# Flatten fields
-df = parsed.select("event.*")
+# validate schema using pydeequ
+def run_schema_validation(batch_df, batch_id):
 
-# ------------------------------------------------------------
-# 5. CREATE EVENT TIMESTAMP & UNIQUE ROW KEY
-# ------------------------------------------------------------
-df = df.withColumn("event_ts", to_timestamp(col("timestamp")))
+    print(f"running deequ validation on batch {batch_id}")
+    
+    valid_rows_df = batch_df.filter(col("data").isNotNull())
 
-df = df.withColumn(
-    "unique_key",
-    concat_ws(
-        "_",
-        col("id"),
-        col("naptanId"),
-        col("expectedArrival")
+    if valid_rows_df.count() == 0:
+        raise Exception("json parsing failed. incoming data does not match schema.")
+
+    exploded = valid_rows_df.select(explode(col("data")).alias("event"))
+    df = exploded.select("event.*")
+
+    check = (Check(spark, CheckLevel.Error, "schemacheck")
+        .isComplete("id")
+        .isComplete("naptanId")
+        .isComplete("stationName")
+        .isComplete("lineId")
+        .isComplete("expectedArrival")
+        .isInt("operationType")
+        .isInt("timeToStation")
+        .isContainedIn("modeName", ["tube"])
     )
-)
 
-# ------------------------------------------------------------
-# 6. DEDUPLICATION WITH WATERMARK
-# ------------------------------------------------------------
-deduped = (
-    df
-        .withWatermark("event_ts", "10 minutes")
-        .dropDuplicates(["unique_key"])
-)
+    results = VerificationSuite(spark).onData(df).addCheck(check).run()
+    status = results.checkResults["schemacheck"].status
 
-# ------------------------------------------------------------
-# 7. WRITE TO HDFS (PARQUET, NO PARTITIONS)
-# ------------------------------------------------------------
+    print("deequ results:", status)
+
+    if status != "Success":
+        raise Exception(f"schema validation failed in batch {batch_id} — data does not match schema.")
+
+    print("batch schema validated successfully")
+
+# write validated json as parquet to incoming
+def write_to_incoming(batch_df, batch_id):
+
+    exploded = batch_df.select(explode(col("data")).alias("event"))
+    df = exploded.select("event.*")
+
+    df.write.mode("overwrite").parquet(incoming_path)
+    print(f"wrote validated batch {batch_id} to incoming parquet")
+
+# apply validation and write for each micro-batch
 query = (
-    deduped.writeStream
-        .format("parquet")
-        .option("path", "hdfs:////tmp/DE011025/uk/streaming/incoming/")
-        .option("checkpointLocation", "hdfs:////tmp/DE011025/uk/streaming/incoming/checkpoints/")
-        .outputMode("append")
+    parsed.writeStream
+        .foreachBatch(lambda batch_df, batch_id: (
+            run_schema_validation(batch_df, batch_id),
+            write_to_incoming(batch_df, batch_id)
+        ))
+        .option("checkpointLocation", checkpoint_path)
         .start()
 )
 
