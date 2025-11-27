@@ -93,8 +93,8 @@ deduped = (
 query = (
     deduped.writeStream
         .format("parquet")
-        .option("path", "hdfs:////tmp/DE011025/uk/streaming/incoming_batches/")
-        .option("checkpointLocation", "hdfs:////tmp/DE011025/uk/streaming/incoming_batches/checkpoints/")
+        .option("path", "hdfs:////tmp/DE011025/uk/streaming/incoming/")
+        .option("checkpointLocation", "hdfs:////tmp/DE011025/uk/streaming/incoming/checkpoints/")
         .outputMode("append")
         .start()
 )
