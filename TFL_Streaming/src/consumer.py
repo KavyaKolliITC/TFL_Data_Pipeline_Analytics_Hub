@@ -2,6 +2,9 @@ from pyspark.sql import SparkSession
 from pyspark.sql.functions import *
 from pyspark.sql.types import *
 
+# ------------------------------------------------------------
+# 1. CREATE SPARK SESSION
+# ------------------------------------------------------------
 spark = (
     SparkSession.builder
         .appName("UK_TFL_STREAMING_CONSUMER_DEDUPED")
@@ -11,10 +14,35 @@ spark = (
 kafka_servers = "ip-172-31-3-80.eu-west-2.compute.internal:9092"
 topic = "ukde011025tfldata"
 
-# ----------------------------
-# READ STREAM FROM KAFKA
-# ----------------------------
-df = (
+# ------------------------------------------------------------
+# 2. OFFICIAL TFL ARRIVALS API SCHEMA
+# ------------------------------------------------------------
+tfl_schema = ArrayType(StructType([
+    StructField("id", StringType()),
+    StructField("operationType", IntegerType()),
+    StructField("vehicleId", StringType()),
+    StructField("naptanId", StringType()),
+    StructField("stationName", StringType()),
+    StructField("lineId", StringType()),
+    StructField("lineName", StringType()),
+    StructField("platformName", StringType()),
+    StructField("direction", StringType()),
+    StructField("bearing", StringType()),
+    StructField("destinationNaptanId", StringType()),
+    StructField("destinationName", StringType()),
+    StructField("timestamp", StringType()),
+    StructField("timeToStation", IntegerType()),
+    StructField("currentLocation", StringType()),
+    StructField("towards", StringType()),
+    StructField("expectedArrival", StringType()),
+    StructField("timeToLive", StringType()),
+    StructField("modeName", StringType())
+]))
+
+# ------------------------------------------------------------
+# 3. READ STREAM FROM KAFKA (REAL-TIME)
+# ------------------------------------------------------------
+kafka_df = (
     spark.readStream
         .format("kafka")
         .option("kafka.bootstrap.servers", kafka_servers)
@@ -23,60 +51,50 @@ df = (
         .load()
 )
 
-json_df = df.selectExpr("CAST(value AS STRING)")
+raw_json_df = kafka_df.selectExpr("CAST(value AS STRING) AS json_value")
 
-# ----------------------------
-# PARSE JSON
-# ----------------------------
-parsed = spark.read.json(json_df.rdd.map(lambda x: x.value))
+# ------------------------------------------------------------
+# 4. PARSE JSON USING from_json() SAFELY (STREAMING-SAFE)
+# ------------------------------------------------------------
+parsed = raw_json_df.withColumn(
+    "data", from_json(col("json_value"), tfl_schema)
+).select(explode(col("data")).alias("event"))
 
-# Ensure timestamp exists
-parsed = parsed.withColumn(
-    "event_ts",
-    to_timestamp(col("timestamp"))  # TFL provides "timestamp"
+# Flatten fields
+df = parsed.select("event.*")
+
+# ------------------------------------------------------------
+# 5. CREATE EVENT TIMESTAMP & UNIQUE ROW KEY
+# ------------------------------------------------------------
+df = df.withColumn("event_ts", to_timestamp(col("timestamp")))
+
+df = df.withColumn(
+    "unique_key",
+    concat_ws(
+        "_",
+        col("id"),
+        col("naptanId"),
+        col("expectedArrival")
+    )
 )
 
-# ----------------------------
-# BUILD UNIQUE DEDUPE KEY
-# ----------------------------
-dedupe_ready = (
-    parsed
-        .withColumn("unique_key",
-            concat_ws("_",
-                col("id"),                 # event id
-                col("stationId"),          # location
-                col("expectedArrival")     # arrival time
-            )
-        )
-)
-
-# ----------------------------
-# WATERMARK + DEDUPE
-# ----------------------------
+# ------------------------------------------------------------
+# 6. DEDUPLICATION WITH WATERMARK
+# ------------------------------------------------------------
 deduped = (
-    dedupe_ready
-        .withWatermark("event_ts", "30 minutes")
+    df
+        .withWatermark("event_ts", "20 minutes")
         .dropDuplicates(["unique_key"])
 )
 
-# ----------------------------
-# ADD DATE/HOUR PARTITIONS
-# ----------------------------
-final_df = (
-    deduped
-        .withColumn("date", to_date(col("event_ts")))
-        .withColumn("hour", hour(col("event_ts")))
-)
-
-# ----------------------------
-# WRITE TO HDFS AS PARQUET
-# ----------------------------
+# ------------------------------------------------------------
+# 7. WRITE TO HDFS (PARQUET, NO PARTITIONS)
+# ------------------------------------------------------------
 query = (
-    final_df.writeStream
+    deduped.writeStream
         .format("parquet")
-        .option("path", "hdfs:///tfl/stream/deduped/")
+        .option("path", "hdfs:///tfl/stream/final_deduped/")
         .option("checkpointLocation", "hdfs:///tfl/stream/checkpoints/")
-        .partitionBy("line", "date", "hour")
         .outputMode("append")
         .start()
 )
